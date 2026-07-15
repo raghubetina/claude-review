@@ -25,10 +25,9 @@ codex plugin marketplace add /absolute/path/to/claude-review
 codex plugin add claude-review@claude-review
 ```
 
-Fully quit and reopen the ChatGPT desktop app after installation so Codex
-rescans local marketplaces. Starting a new task without restarting the app is
-not sufficient. Invoke the skill with `$claude-review`; once loaded, it also
-appears in the `/` command picker.
+After installation, start a new Codex process. In Codex CLI, invoke the skill
+with `$claude-review`; `/claude-review` is not a slash command. In the ChatGPT
+desktop app, fully quit and reopen the app so it rescans local marketplaces.
 
 ## Use
 
