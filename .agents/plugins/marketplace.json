@@ -1,0 +1,20 @@
+{
+  "name": "claude-review",
+  "interface": {
+    "displayName": "Claude Review"
+  },
+  "plugins": [
+    {
+      "name": "claude-review",
+      "source": {
+        "source": "local",
+        "path": "./plugins/claude-review"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

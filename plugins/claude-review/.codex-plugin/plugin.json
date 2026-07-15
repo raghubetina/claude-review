@@ -1,0 +1,27 @@
+{
+  "name": "claude-review",
+  "version": "0.1.0+codex.20260715202458",
+  "description": "Review working changes, branches, commits, ranges, or repositories with Claude from Codex.",
+  "author": {
+    "name": "Raghu Betina",
+    "url": "https://github.com/raghubetina"
+  },
+  "repository": "https://github.com/raghubetina/claude-review",
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Claude Review",
+    "shortDescription": "Persistent, scoped code reviews with Claude.",
+    "longDescription": "Ask Claude to review exact Git scopes from Codex, keep context across re-reviews, and preserve inspectable local artifacts.",
+    "developerName": "Raghu Betina",
+    "category": "Productivity",
+    "capabilities": [
+      "Interactive",
+      "Read"
+    ],
+    "defaultPrompt": [
+      "Review my current working changes with Claude.",
+      "Ask Claude to review this branch against main.",
+      "Show the latest Claude review result."
+    ]
+  }
+}

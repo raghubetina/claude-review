@@ -1,0 +1,6 @@
+interface:
+  display_name: "Claude Review"
+  short_description: "Persistent, scoped code reviews with Claude"
+  default_prompt: "Use $claude-review to review my current working changes."
+policy:
+  allow_implicit_invocation: true
