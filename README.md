@@ -45,6 +45,10 @@ Supported scopes are `working` (the default), `branch [base]`, `commit [ref]`, `
 
 Background reviews support `status`, `result`, and `cancel`.
 
+Codex chooses foreground or background execution from the surrounding workflow unless the user specifies one.
+A healthy review is allowed to finish without an additional agent-side timeout merely because it is quiet or
+long-running.
+
 ## Review artifacts
 
 Each reviewed repository gets an ignored `tmp/claude_reviews/` directory containing sequenced review artifacts, session metadata, and background-job state. If necessary, the plugin adds `tmp/claude_reviews/` to Git's local `info/exclude`; it does not modify the repository's tracked `.gitignore`.

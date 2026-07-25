@@ -348,6 +348,8 @@ test("skill contract points to its bundled runtime", () => {
   const skillDirectory = path.resolve(TEST_ROOT, "../plugins/claude-review/skills/claude-review");
   const skill = fs.readFileSync(path.join(skillDirectory, "SKILL.md"), "utf8");
   assert.match(skill, /\$SKILL_DIR\/scripts\/claude-review\.mjs/);
+  assert.match(skill, /Choose foreground or background execution from the workflow/);
+  assert.match(skill, /Do not impose an agent-side timeout/);
   assert.ok(fs.existsSync(path.join(skillDirectory, "scripts", "claude-review.mjs")));
 });
 
