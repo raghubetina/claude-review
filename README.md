@@ -39,9 +39,19 @@ Use $claude-review to review this branch against main.
 Use $claude-review to review the last commit, focusing on authorization.
 Use $claude-review to review ../another-repo in the background.
 Use $claude-review to review it again. The callback API is intentionally retained for compatibility.
+Use $claude-review to continue session SESSION_ID over only PRIOR_HEAD..HEAD.
 ```
 
-Supported scopes are `working` (the default), `branch [base]`, `commit [ref]`, `range <from>..<to>`, and `repo`. `again` repeats the previous scope in the current Claude session, `new` starts a fresh session, and `reset` forgets the active session without deleting its artifacts.
+Supported scopes are `working` (the default), `branch [base]`, `commit [ref]`, `range <from>..<to>`, and `repo`.
+`again` repeats the previous scope in the current Claude session. `--resume-session <session-id>` resumes that exact
+active session with a clean, committed scope when branch identity changes. Its stored scope and HEAD must identify
+the same recorded commit tip, that tip must remain an ancestor of the current HEAD, and the requested scope tip must
+match the current HEAD. No other active session may already own the destination checkout identity. A successful
+resume follows the current checkout identity. Session artifacts belong to one
+working-tree root, so pass the ID again after each detached HEAD change and run the focused range from that same root.
+Keep that working tree untouched until an exact resumed review finishes; a background review may overlap work in a
+different checkout, but fails closed if its own checkout changes.
+`new` starts a fresh session, and `reset` forgets the active session without deleting its artifacts.
 
 Background reviews support `status`, `result`, and `cancel`.
 
@@ -61,7 +71,9 @@ Claude receives a bounded, secret-filtered Git context over stdin and only the `
 npm test
 ```
 
-The test suite uses disposable Git repositories and a fake Claude executable. It covers scope resolution, session resumption, background jobs, cancellation, stale-job recovery, large diffs, history replacement, failures, and safe invocation arguments.
+The test suite uses disposable Git repositories and a fake Claude executable. It covers scope resolution, automatic
+and explicit session resumption, advancing detached review worktrees, background jobs, cancellation, stale-job
+recovery, large diffs, history replacement, failures, and safe invocation arguments.
 
 After installing a development build, verify real cached-skill discovery from a fresh Codex process without starting a Claude review:
 

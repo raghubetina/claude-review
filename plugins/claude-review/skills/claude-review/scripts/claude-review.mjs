@@ -68,6 +68,7 @@ Usage:
 
 Options:
   --dir <path>                 Target repository (default: current directory)
+  --resume-session <id>        Resume this repository's prior active session
   --model <model>              Explicit Claude model override
   --effort <level>             low|medium|high|xhigh|max (default: max)
   --include-working            Include local changes with branch/commit/range
@@ -89,6 +90,7 @@ function takeValue(argv, index, option) {
 export function parseArguments(argv) {
   const options = {
     dir: process.cwd(),
+    resumeSessionId: null,
     model: null,
     effort: "max",
     includeWorking: false,
@@ -112,6 +114,11 @@ export function parseArguments(argv) {
     }
     if (argument === "--dir") {
       options.dir = takeValue(argv, index, argument);
+      index += 1;
+      continue;
+    }
+    if (argument === "--resume-session") {
+      options.resumeSessionId = takeValue(argv, index, argument);
       index += 1;
       continue;
     }
@@ -165,7 +172,6 @@ export function parseArguments(argv) {
   if (options.background && options.wait) {
     throw new Error("Choose either --background or --wait.");
   }
-
   let action = positional.shift() ?? "working";
   let forceNew = false;
   if (action === "new") {
@@ -175,6 +181,15 @@ export function parseArguments(argv) {
   if (!SCOPES.has(action) && !ACTIONS.has(action)) {
     positional.unshift(action);
     action = "working";
+  }
+  if (forceNew && options.resumeSessionId) {
+    throw new Error("new cannot use --resume-session.");
+  }
+  if (options.resumeSessionId && options.includeWorking) {
+    throw new Error("--resume-session cannot use --include-working; resume an exact committed scope from a clean checkout.");
+  }
+  if (options.resumeSessionId && action === "working") {
+    throw new Error("--resume-session requires an exact committed scope such as range, commit, branch, or repo.");
   }
 
   let scopeArgument = null;
@@ -205,6 +220,9 @@ export function parseArguments(argv) {
   }
   if ((action === "status" || action === "result" || action === "cancel" || action === "reset") && options.background) {
     throw new Error(`${action} does not accept --background.`);
+  }
+  if (["status", "result", "cancel", "reset", "help"].includes(action) && options.resumeSessionId) {
+    throw new Error(`${action} does not accept --resume-session.`);
   }
 
   return {
@@ -372,6 +390,35 @@ function activeSession(root, branch) {
     .sort((left, right) => String(right.session.created_at).localeCompare(String(left.session.created_at)))[0] ?? null;
 }
 
+function assertDestinationSessionAvailable(root, branch, sessionId) {
+  const conflicting = loadSessions(root).find(({ session }) =>
+    session.active && session.branch === branch && session.session_id !== sessionId
+  );
+  if (conflicting) {
+    throw new Error(
+      `Claude review session ${conflicting.session.session_id} is already active for ${branch}; reset or continue that session before moving another one here.`
+    );
+  }
+}
+
+function sessionById(root, repoRoot, sessionId) {
+  const matches = loadSessions(root).filter(({ session }) => session.session_id === sessionId);
+  if (matches.length === 0) {
+    throw new Error(`No Claude review session ${sessionId} exists for this repository.`);
+  }
+  if (matches.length > 1) {
+    throw new Error(`Multiple Claude review sessions unexpectedly use ID ${sessionId}.`);
+  }
+  const entry = matches[0];
+  if (entry.session.repo_root !== repoRoot) {
+    throw new Error(`Claude review session ${sessionId} belongs to another repository.`);
+  }
+  if (!entry.session.active) {
+    throw new Error(`Claude review session ${sessionId} is inactive; start a new review instead.`);
+  }
+  return entry;
+}
+
 function processAlive(pid) {
   if (!Number.isInteger(pid) || pid <= 0) return false;
   try {
@@ -391,6 +438,12 @@ function historyContinues(repoRoot, session) {
   const currentHead = headCommit(repoRoot);
   if (!session.last_head || !currentHead) return true;
   return git(repoRoot, ["merge-base", "--is-ancestor", session.last_head, currentHead], { allowFailure: true }).status === 0;
+}
+
+function scopeTip(scope) {
+  if (scope.kind === "range") return scope.to;
+  if (scope.kind === "commit") return scope.commit;
+  return scope.head ?? null;
 }
 
 function createTask(root, repoRoot, branch, explicitModel = null) {
@@ -632,11 +685,49 @@ function jobId() {
 async function prepareJob(parsed, repoRoot, root) {
   return withLock(path.join(root, ".state.lock"), async () => {
     const branch = currentBranchIdentity(repoRoot);
-    let entry = activeSession(root, branch);
+    const preparedHead = headCommit(repoRoot);
+    const explicitlySelected = Boolean(parsed.options.resumeSessionId);
+    let entry = explicitlySelected
+      ? sessionById(root, repoRoot, parsed.options.resumeSessionId)
+      : activeSession(root, branch);
     if (parsed.action === "again" && !entry) {
       throw new Error(`No active Claude review session exists for ${branch}; run a review first.`);
     }
-    if (entry && !historyContinues(repoRoot, entry.session)) {
+    if (explicitlySelected) {
+      assertDestinationSessionAvailable(root, branch, entry.session.session_id);
+    }
+    if (explicitlySelected && Number(entry.session.review_count ?? 0) === 0) {
+      throw new Error(
+        `Claude review session ${entry.session.session_id} has no completed review to resume.`
+      );
+    }
+    if (explicitlySelected && !entry.session.last_head) {
+      throw new Error(
+        `Claude review session ${entry.session.session_id} has no committed reviewed HEAD; start a new review instead.`
+      );
+    }
+    if (explicitlySelected) {
+      const priorReviewedTip = entry.session.last_scope ? scopeTip(entry.session.last_scope) : null;
+      if (!priorReviewedTip || priorReviewedTip !== entry.session.last_head) {
+        throw new Error(
+          `Claude review session ${entry.session.session_id} has a stored scope and HEAD that do not identify the same recorded commit tip; start a new review instead.`
+        );
+      }
+    }
+    if (explicitlySelected && !preparedHead) {
+      throw new Error(
+        `Claude review session ${entry.session.session_id} cannot resume on an unborn HEAD.`
+      );
+    }
+    if (
+      explicitlySelected &&
+      git(repoRoot, ["merge-base", "--is-ancestor", entry.session.last_head, preparedHead], { allowFailure: true }).status !== 0
+    ) {
+      throw new Error(
+        `Claude review session ${entry.session.session_id} cannot resume because its last reviewed HEAD is not an ancestor of the current HEAD.`
+      );
+    }
+    if (entry && !explicitlySelected && !historyContinues(repoRoot, entry.session)) {
       entry.session.active = false;
       entry.session.reset_at = new Date().toISOString();
       entry.session.reset_reason = "branch history no longer continues from the last reviewed HEAD";
@@ -675,6 +766,38 @@ async function prepareJob(parsed, repoRoot, root) {
       parsed.options.includeWorking,
       entry.session.last_scope
     );
+    if (headCommit(repoRoot) !== preparedHead) {
+      throw new Error("Repository HEAD moved while resolving the review scope.");
+    }
+    const reviewedTip = scopeTip(scope);
+    if (explicitlySelected && scope.kind === "working") {
+      throw new Error(
+        `Claude review session ${entry.session.session_id} requires an exact committed scope such as range, commit, branch, or repo.`
+      );
+    }
+    if (explicitlySelected && workingState(repoRoot).dirty) {
+      throw new Error(
+        `Claude review session ${entry.session.session_id} requires a clean working tree for an exact resumed review.`
+      );
+    }
+    if (explicitlySelected && !reviewedTip) {
+      throw new Error(
+        `Claude review session ${entry.session.session_id} cannot resume a scope without a committed tip.`
+      );
+    }
+    if (
+      explicitlySelected &&
+      git(repoRoot, ["merge-base", "--is-ancestor", entry.session.last_head, reviewedTip], { allowFailure: true }).status !== 0
+    ) {
+      throw new Error(
+        `Claude review session ${entry.session.session_id} cannot resume because its last reviewed HEAD is not an ancestor of the requested scope.`
+      );
+    }
+    if (explicitlySelected && reviewedTip !== preparedHead) {
+      throw new Error(
+        `Claude review session ${entry.session.session_id} cannot resume because the requested scope tip does not match the current HEAD.`
+      );
+    }
     const id = jobId();
     const job = {
       version: STATE_VERSION,
@@ -685,7 +808,11 @@ async function prepareJob(parsed, repoRoot, root) {
       updated_at: new Date().toISOString(),
       repo_root: repoRoot,
       branch,
+      checkout_head: preparedHead,
+      reviewed_tip: reviewedTip,
       task_directory: entry.directory,
+      session_id: entry.session.session_id,
+      explicit_resume: explicitlySelected,
       scope,
       focus: parsed.focus,
       model: parsed.options.model ?? entry.session.explicit_model ?? null,
@@ -1016,6 +1143,9 @@ function artifactMarkdown(job, session, parsedOutput, invocation, status = "comp
   const reviewBody = parsedOutput?.structured
     ? renderStructured(parsedOutput.structured)
     : parsedOutput?.rawResult || "(Claude did not return a usable review.)";
+  const body = error
+    ? `## Error\n\n${error}\n${parsedOutput ? `\n## Review output (not applied)\n\n${reviewBody}` : ""}`
+    : reviewBody;
   return `# Claude Review
 
 - Status: ${status}
@@ -1043,8 +1173,20 @@ ${JSON.stringify(job.scope, null, 2)}
 
 ${job.focus || "(none)"}
 
-${error ? `## Error\n\n${error}\n` : reviewBody}
+${body}
 `;
+}
+
+function assertPreparedCheckout(job) {
+  const current = headCommit(job.repo_root);
+  if (current !== (job.checkout_head ?? null)) {
+    throw new Error(
+      `Repository HEAD moved during review: expected ${job.checkout_head ?? "an unborn branch"}, found ${current ?? "an unborn branch"}.`
+    );
+  }
+  if (workingState(job.repo_root).dirty) {
+    throw new Error("Repository working tree changed during the exact resumed review.");
+  }
 }
 
 async function executeJob(root, job) {
@@ -1056,21 +1198,36 @@ async function executeJob(root, job) {
     const sessionPath = path.join(job.task_directory, "session.json");
     const session = readJson(sessionPath);
     if (!session) throw new Error(`Missing session metadata: ${sessionPath}`);
+    let invocation = null;
+    let parsedOutput = null;
     try {
-      const invocation = await invokeClaude(job, session);
-      const parsedOutput = parseClaudeOutput(invocation.stdout);
+      if (job.explicit_resume) assertPreparedCheckout(job);
+      invocation = await invokeClaude(job, session);
+      parsedOutput = parseClaudeOutput(invocation.stdout);
       if (parsedOutput.sessionId && parsedOutput.sessionId !== session.session_id) {
         throw new Error(`Claude returned unexpected session ID ${parsedOutput.sessionId}; expected ${session.session_id}.`);
       }
       const sequence = nextArtifactSequence(job.task_directory);
       const artifact = path.join(job.task_directory, `${String(sequence).padStart(3, "0")}-${scopeLabel(job.scope)}.md`);
-      atomicWriteText(artifact, artifactMarkdown(job, session, parsedOutput, invocation));
-      session.last_reviewed_at = new Date().toISOString();
-      session.review_count = Number(session.review_count ?? 0) + 1;
-      session.last_scope = job.scope;
-      session.last_head = headCommit(job.repo_root);
-      if (job.model) session.explicit_model = job.model;
-      saveSession(job.task_directory, session);
+      const commitReview = () => {
+        atomicWriteText(artifact, artifactMarkdown(job, session, parsedOutput, invocation));
+        session.last_reviewed_at = new Date().toISOString();
+        session.review_count = Number(session.review_count ?? 0) + 1;
+        session.last_scope = job.scope;
+        session.last_head = job.explicit_resume ? job.reviewed_tip : headCommit(job.repo_root);
+        if (job.explicit_resume) session.branch = job.branch;
+        if (job.model) session.explicit_model = job.model;
+        saveSession(job.task_directory, session);
+      };
+      if (job.explicit_resume) {
+        await withLock(path.join(root, ".state.lock"), async () => {
+          assertPreparedCheckout(job);
+          assertDestinationSessionAvailable(root, job.branch, session.session_id);
+          commitReview();
+        });
+      } else {
+        commitReview();
+      }
       job.status = "completed";
       job.completed_at = new Date().toISOString();
       job.artifact = artifact;
@@ -1085,7 +1242,10 @@ async function executeJob(root, job) {
       const failedDirectory = path.join(job.task_directory, "failed");
       fs.mkdirSync(failedDirectory, { recursive: true });
       const failedArtifact = path.join(failedDirectory, `${job.id}.md`);
-      atomicWriteText(failedArtifact, artifactMarkdown(job, session, null, null, cancelled ? "cancelled" : "failed", persistedError));
+      atomicWriteText(
+        failedArtifact,
+        artifactMarkdown(job, session, parsedOutput, invocation, cancelled ? "cancelled" : "failed", persistedError)
+      );
       job.status = cancelled ? "cancelled" : "failed";
       job.completed_at = new Date().toISOString();
       job.error = persistedError;
@@ -1103,7 +1263,8 @@ function renderJob(job, includeResult = false) {
     `Status: ${job.status}`,
     `Repository: ${job.repo_root}`,
     `Scope: ${job.scope?.kind ?? "unknown"}`,
-    `Session: ${job.resumed ? "resumed" : "new"}`
+    `Session: ${job.resumed ? "resumed" : "new"}`,
+    `Session ID: ${job.session_id ?? "unknown"}`
   ];
   if (job.pid) lines.push(`PID: ${job.pid}`);
   if (job.artifact) lines.push(`Artifact: ${job.artifact}`);

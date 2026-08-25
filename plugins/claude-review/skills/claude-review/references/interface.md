@@ -14,6 +14,24 @@ claude-review.mjs new [scope]                 new session, then review
 claude-review.mjs reset                       forget active session; retain artifacts
 ```
 
+Every review result prints its session ID. To resume that exact active session with a new scope after the branch
+identity changes, including when an exact-commit review worktree advances to a descendant, pass:
+
+```text
+claude-review.mjs --resume-session <session-id> range <prior-head>..<current-head> [-- focus]
+```
+
+The selected session must remain active in the same working-tree root and use a clean checkout with a committed
+scope (`branch`, `commit`, `range`, or `repo`); working scope and `--include-working` are rejected. It must have a
+completed review whose stored scope and HEAD identify the same recorded commit tip, keep that tip as an ancestor of
+the current HEAD, and target a new scope whose committed tip equals that HEAD. No other active session may already
+own the destination checkout identity. A successful resume follows the current checkout identity. A sibling linked
+worktree has separate session storage. Pass the ID again after each
+detached HEAD change, and leave that working tree untouched until the resumed review finishes. Background execution
+may overlap work in another checkout, but fails closed if its own checkout changes. `again` repeats the selected
+session's previous scope definition; use an explicit range for a focused delta. Use `new` when history, review scope, or
+intended context should not continue.
+
 Put custom focus or follow-up feedback after `--`:
 
 ```text
@@ -27,6 +45,7 @@ The runtime also accepts trailing focus text without `--` when unambiguous.
 
 ```text
 --dir <path>                 target another repository
+--resume-session <id>        resume this repository's prior active session
 --model <model>              explicitly select and persist a model for this session
 --effort <level>             low, medium, high, xhigh, or max; default max
 --include-working            add local changes to branch, commit, or range scope
@@ -54,6 +73,7 @@ When no job ID is supplied, operate on the latest applicable job.
 - “Review everything since v1.2” → `range v1.2..HEAD`
 - “Review the architecture/codebase” → `repo`
 - “Review it again” → `again`
+- “Continue session X over only these fixes” → `--resume-session X range PRIOR_HEAD..HEAD`
 - “Start over with Claude” → `new`
 - “Forget that review thread” → `reset`
 - “Run it while we keep working” → `--background`

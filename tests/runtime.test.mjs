@@ -55,8 +55,12 @@ function reviewEnv(logPath, extra = {}) {
   };
 }
 
+function fakeLogPath(repo) {
+  return path.join(repo, "tmp", "claude_reviews", "fake-claude.jsonl");
+}
+
 function runReview(repo, args = [], extraEnv = {}) {
-  const logPath = path.join(repo, "fake-claude.jsonl");
+  const logPath = fakeLogPath(repo);
   const result = command(process.execPath, [RUNTIME, "--dir", repo, ...args], {
     cwd: repo,
     env: reviewEnv(logPath, extraEnv),
@@ -96,12 +100,19 @@ test("parseArguments preserves natural focus and job IDs", () => {
   const status = parseArguments(["status", "review-123"]);
   assert.equal(status.jobId, "review-123");
   assert.equal(status.focus, "");
+  const selected = parseArguments(["--resume-session", "session-1", "range", "HEAD~1..HEAD"]);
+  assert.equal(selected.options.resumeSessionId, "session-1");
+  assert.equal(selected.action, "range");
 });
 
 test("parseArguments rejects contradictory execution options", () => {
   assert.throws(() => parseArguments(["--wait", "--background"]), /either --background or --wait/);
   assert.throws(() => parseArguments(["working", "--include-working"]), /not valid/);
   assert.throws(() => parseArguments(["range", "HEAD"]), /form <from>\.\.<to>/);
+  assert.throws(() => parseArguments(["--resume-session", "session-1", "new", "working"]), /cannot use/);
+  assert.throws(() => parseArguments(["--resume-session", "session-1", "range", "A..B", "--include-working"]), /clean checkout/);
+  assert.throws(() => parseArguments(["--resume-session", "session-1"]), /exact committed scope/);
+  assert.throws(() => parseArguments(["--resume-session", "session-1", "status"]), /does not accept --resume-session/);
 });
 
 test("parseClaudeOutput accepts single envelopes and transcript arrays", () => {
@@ -187,6 +198,376 @@ test("again resumes the exact session and forwards feedback", () => {
   assert.equal(sessions(repo)[0].session.review_count, 2);
 });
 
+test("an off-HEAD normal scope retains automatic branch continuity", () => {
+  const repo = createRepo();
+  const main = git(repo, "rev-parse", "HEAD");
+  git(repo, "checkout", "-b", "feature");
+  fs.writeFileSync(path.join(repo, "example.txt"), "feature\n", "utf8");
+  git(repo, "add", "example.txt");
+  git(repo, "commit", "-m", "feature candidate");
+  const feature = git(repo, "rev-parse", "HEAD");
+  git(repo, "checkout", "main");
+
+  const first = runReview(repo, ["range", `${main}..${feature}`]);
+  const sessionId = sessions(repo)[0].session.session_id;
+  assert.equal(sessions(repo)[0].session.last_head, main);
+  fs.writeFileSync(path.join(repo, "example.txt"), "main follow-up\n", "utf8");
+  const second = runReview(repo);
+
+  assert.match(second.result.stdout, new RegExp(`Session ID: ${sessionId}`));
+  assert.equal(calls(first.logPath).length, 2);
+  assert.equal(sessions(repo)[0].session.review_count, 2);
+  assert.equal(sessions(repo)[0].session.active, true);
+});
+
+test("an explicit session resumes across advancing detached HEADs", () => {
+  const repo = createRepo();
+  const base = git(repo, "rev-parse", "HEAD");
+  fs.writeFileSync(path.join(repo, "example.txt"), "reviewed\n", "utf8");
+  git(repo, "add", "example.txt");
+  git(repo, "commit", "-m", "reviewed candidate");
+  const reviewed = git(repo, "rev-parse", "HEAD");
+  git(repo, "checkout", "--detach", reviewed);
+
+  const first = runReview(repo, ["new", "range", `${base}..${reviewed}`]);
+  const sessionId = sessions(repo)[0].session.session_id;
+  assert.match(first.result.stdout, new RegExp(`Session ID: ${sessionId}`));
+
+  fs.writeFileSync(path.join(repo, "example.txt"), "reviewed and fixed\n", "utf8");
+  git(repo, "add", "example.txt");
+  git(repo, "commit", "-m", "fix review finding");
+  const fixed = git(repo, "rev-parse", "HEAD");
+  const second = runReview(repo, [
+    "--resume-session",
+    sessionId,
+    "range",
+    `${reviewed}..${fixed}`,
+    "--",
+    "Verify the bounded fix"
+  ]);
+
+  const invocations = calls(first.logPath);
+  assert.equal(invocations.length, 2);
+  assert.ok(invocations[1].args.includes("--resume"));
+  assert.equal(invocations[1].sessionId, sessionId);
+  assert.match(invocations[1].input, /Verify the bounded fix/);
+  assert.match(invocations[1].input, new RegExp(`${reviewed}\\.\\.${fixed}`));
+  assert.match(second.result.stdout, new RegExp(`Session ID: ${sessionId}`));
+  assert.equal(sessions(repo).length, 1);
+  assert.equal(sessions(repo)[0].session.review_count, 2);
+  assert.equal(sessions(repo)[0].session.last_head, fixed);
+  assert.equal(sessions(repo)[0].session.branch, `detached-${fixed.slice(0, 12)}`);
+  const third = runReview(repo, ["again", "--", "Confirm the same session remains active"]);
+  assert.match(third.result.stdout, new RegExp(`Session ID: ${sessionId}`));
+  assert.equal(sessions(repo)[0].session.review_count, 3);
+  const jobs = fs.readdirSync(path.join(repo, "tmp", "claude_reviews", "jobs"))
+    .filter((name) => name.endsWith(".json"))
+    .map((name) => JSON.parse(fs.readFileSync(path.join(repo, "tmp", "claude_reviews", "jobs", name), "utf8")));
+  assert.ok(jobs.every((job) => job.session_id === sessionId));
+});
+
+test("an explicit session refuses to shadow an active destination session", () => {
+  const repo = createRepo();
+  const base = git(repo, "rev-parse", "HEAD");
+  fs.writeFileSync(path.join(repo, "example.txt"), "main review\n", "utf8");
+  const first = runReview(repo);
+  const mainSessionId = sessions(repo)[0].session.session_id;
+  git(repo, "restore", "example.txt");
+
+  git(repo, "checkout", "-b", "feature");
+  fs.writeFileSync(path.join(repo, "example.txt"), "feature\n", "utf8");
+  git(repo, "add", "example.txt");
+  git(repo, "commit", "-m", "feature candidate");
+  const feature = git(repo, "rev-parse", "HEAD");
+  runReview(repo, ["commit", "HEAD"]);
+  const featureSessionId = sessions(repo)
+    .find(({ session }) => session.branch === "feature").session.session_id;
+
+  git(repo, "checkout", "main");
+  git(repo, "merge", "--ff-only", "feature");
+  const result = command(
+    process.execPath,
+    [RUNTIME, "--dir", repo, "--resume-session", featureSessionId, "range", `${base}..${feature}`],
+    { cwd: repo, env: reviewEnv(first.logPath), allowFailure: true }
+  );
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, new RegExp(`session ${mainSessionId} is already active for main`));
+  assert.equal(calls(first.logPath).length, 2);
+  assert.equal(sessions(repo).filter(({ session }) => session.active).length, 2);
+  assert.equal(sessions(repo).find(({ session }) => session.session_id === mainSessionId).session.branch, "main");
+  assert.equal(sessions(repo).find(({ session }) => session.session_id === featureSessionId).session.branch, "feature");
+});
+
+test("an explicit session rechecks its destination before moving there", async () => {
+  const repo = createRepo();
+  const base = git(repo, "rev-parse", "HEAD");
+  fs.writeFileSync(path.join(repo, "example.txt"), "reviewed\n", "utf8");
+  git(repo, "add", "example.txt");
+  git(repo, "commit", "-m", "reviewed candidate");
+  const reviewed = git(repo, "rev-parse", "HEAD");
+  git(repo, "checkout", "--detach", reviewed);
+  const first = runReview(repo, ["new", "range", `${base}..${reviewed}`]);
+  const original = sessions(repo)[0];
+
+  fs.writeFileSync(path.join(repo, "example.txt"), "fixed\n", "utf8");
+  git(repo, "add", "example.txt");
+  git(repo, "commit", "-m", "fix review finding");
+  const fixed = git(repo, "rev-parse", "HEAD");
+  const destination = `detached-${fixed.slice(0, 12)}`;
+  const started = command(
+    process.execPath,
+    [
+      RUNTIME,
+      "--dir",
+      repo,
+      "--resume-session",
+      original.session.session_id,
+      "range",
+      `${reviewed}..${fixed}`,
+      "--background"
+    ],
+    {
+      cwd: repo,
+      env: reviewEnv(first.logPath, { FAKE_CLAUDE_DELAY_MS: "1500" })
+    }
+  );
+  const id = started.stdout.match(/Claude review job: (\S+)/)?.[1];
+  assert.ok(id);
+
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    if (calls(first.logPath).length === 2) break;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  assert.equal(calls(first.logPath).length, 2);
+  const lateDirectory = path.join(repo, "tmp", "claude_reviews", "999-late-destination");
+  fs.mkdirSync(lateDirectory);
+  fs.writeFileSync(path.join(lateDirectory, "session.json"), `${JSON.stringify({
+    version: 1,
+    session_id: "late-destination-session",
+    repo_root: repo,
+    branch: destination,
+    active: true,
+    created_at: new Date().toISOString(),
+    last_reviewed_at: new Date().toISOString(),
+    review_count: 1,
+    explicit_model: null,
+    last_scope: { kind: "commit", commit: fixed },
+    last_head: fixed
+  }, null, 2)}\n`, "utf8");
+
+  let status;
+  for (let attempt = 0; attempt < 60; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    status = command(process.execPath, [RUNTIME, "status", id, "--dir", repo]).stdout;
+    if (status.includes("Status: failed")) break;
+  }
+  assert.match(status, /Status: failed/);
+  assert.match(status, /session late-destination-session is already active/);
+  const after = sessions(repo);
+  const originalAfter = after.find(({ session }) => session.session_id === original.session.session_id);
+  assert.equal(originalAfter.session.review_count, 1);
+  assert.equal(originalAfter.session.branch, `detached-${reviewed.slice(0, 12)}`);
+  assert.equal(fs.readdirSync(originalAfter.directory).filter((name) => /^\d{3}-.*\.md$/.test(name)).length, 1);
+  assert.equal(after.find(({ session }) => session.session_id === "late-destination-session").session.branch, destination);
+});
+
+test("an ordinary review can complete while preparation state is locked", async () => {
+  const repo = createRepo();
+  fs.writeFileSync(path.join(repo, "example.txt"), "changed\n", "utf8");
+  const logPath = fakeLogPath(repo);
+  const started = command(process.execPath, [RUNTIME, "--dir", repo, "working", "--background"], {
+    cwd: repo,
+    env: reviewEnv(logPath, { FAKE_CLAUDE_DELAY_MS: "1500" })
+  });
+  const id = started.stdout.match(/Claude review job: (\S+)/)?.[1];
+  assert.ok(id);
+
+  for (let attempt = 0; attempt < 150; attempt += 1) {
+    if (fs.existsSync(logPath) && calls(logPath).length === 1) break;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  assert.equal(calls(logPath).length, 1);
+  const lockPath = path.join(repo, "tmp", "claude_reviews", ".state.lock");
+  fs.writeFileSync(lockPath, `${process.pid}\n`, "utf8");
+
+  let status;
+  try {
+    for (let attempt = 0; attempt < 60; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      status = command(process.execPath, [RUNTIME, "status", id, "--dir", repo]).stdout;
+      if (status.includes("Status: completed")) break;
+    }
+  } finally {
+    fs.rmSync(lockPath, { force: true });
+  }
+  assert.match(status, /Status: completed/);
+  assert.equal(sessions(repo)[0].session.review_count, 1);
+});
+
+test("an explicit session refuses replacement history instead of silently starting over", () => {
+  const repo = createRepo();
+  fs.writeFileSync(path.join(repo, "example.txt"), "reviewed\n", "utf8");
+  runReview(repo);
+  const sessionId = sessions(repo)[0].session.session_id;
+
+  git(repo, "checkout", "--orphan", "replacement");
+  git(repo, "rm", "-rf", ".");
+  fs.writeFileSync(path.join(repo, "replacement.txt"), "replacement\n", "utf8");
+  git(repo, "add", "replacement.txt");
+  git(repo, "commit", "-m", "replacement history");
+  const result = command(process.execPath, [RUNTIME, "--dir", repo, "--resume-session", sessionId, "repo"], {
+    cwd: repo,
+    env: reviewEnv(path.join(repo, "fake-claude.jsonl")),
+    allowFailure: true
+  });
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /last reviewed HEAD is not an ancestor/);
+  assert.equal(sessions(repo).length, 1);
+  assert.equal(sessions(repo)[0].session.active, true);
+  assert.equal(sessions(repo)[0].session.review_count, 1);
+});
+
+test("an explicit session requires its prior HEAD to precede the requested scope", () => {
+  const repo = createRepo();
+  const base = git(repo, "rev-parse", "HEAD");
+  fs.writeFileSync(path.join(repo, "example.txt"), "reviewed\n", "utf8");
+  git(repo, "add", "example.txt");
+  git(repo, "commit", "-m", "reviewed candidate");
+  const reviewed = git(repo, "rev-parse", "HEAD");
+  runReview(repo, ["range", `${base}..${reviewed}`]);
+  const sessionId = sessions(repo)[0].session.session_id;
+
+  fs.writeFileSync(path.join(repo, "example.txt"), "later\n", "utf8");
+  git(repo, "add", "example.txt");
+  git(repo, "commit", "-m", "later candidate");
+  const result = command(
+    process.execPath,
+    [RUNTIME, "--dir", repo, "--resume-session", sessionId, "range", `${base}..${base}`],
+    { cwd: repo, env: reviewEnv(path.join(repo, "fake-claude.jsonl")), allowFailure: true }
+  );
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /last reviewed HEAD is not an ancestor of the requested scope/);
+  assert.equal(sessions(repo)[0].session.review_count, 1);
+});
+
+test("an explicit session rejects legacy off-HEAD review metadata", () => {
+  const repo = createRepo();
+  const base = git(repo, "rev-parse", "HEAD");
+  fs.writeFileSync(path.join(repo, "example.txt"), "reviewed\n", "utf8");
+  git(repo, "add", "example.txt");
+  git(repo, "commit", "-m", "reviewed candidate");
+  const reviewed = git(repo, "rev-parse", "HEAD");
+  const first = runReview(repo, ["range", `${base}..${reviewed}`]);
+  const entry = sessions(repo)[0];
+
+  fs.writeFileSync(path.join(repo, "example.txt"), "ambient\n", "utf8");
+  git(repo, "add", "example.txt");
+  git(repo, "commit", "-m", "unreviewed ambient commit");
+  const ambient = git(repo, "rev-parse", "HEAD");
+  entry.session.last_head = ambient;
+  fs.writeFileSync(path.join(entry.directory, "session.json"), `${JSON.stringify(entry.session, null, 2)}\n`, "utf8");
+
+  fs.writeFileSync(path.join(repo, "example.txt"), "later\n", "utf8");
+  git(repo, "add", "example.txt");
+  git(repo, "commit", "-m", "later candidate");
+  const later = git(repo, "rev-parse", "HEAD");
+  const result = command(
+    process.execPath,
+    [RUNTIME, "--dir", repo, "--resume-session", entry.session.session_id, "range", `${ambient}..${later}`],
+    { cwd: repo, env: reviewEnv(first.logPath), allowFailure: true }
+  );
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /do not identify the same recorded commit tip/);
+  assert.equal(calls(first.logPath).length, 1);
+  assert.equal(sessions(repo)[0].session.review_count, 1);
+  assert.equal(sessions(repo)[0].session.last_head, ambient);
+});
+
+test("an explicit committed range refuses uncommitted checkout bytes", () => {
+  const repo = createRepo();
+  const base = git(repo, "rev-parse", "HEAD");
+  fs.writeFileSync(path.join(repo, "example.txt"), "reviewed\n", "utf8");
+  git(repo, "add", "example.txt");
+  git(repo, "commit", "-m", "reviewed candidate");
+  const reviewed = git(repo, "rev-parse", "HEAD");
+  const first = runReview(repo, ["range", `${base}..${reviewed}`]);
+  const session = sessions(repo)[0].session;
+
+  fs.writeFileSync(path.join(repo, "example.txt"), "fixed\n", "utf8");
+  git(repo, "add", "example.txt");
+  git(repo, "commit", "-m", "fix review finding");
+  const fixed = git(repo, "rev-parse", "HEAD");
+  fs.writeFileSync(path.join(repo, "example.txt"), "uncommitted distraction\n", "utf8");
+  const result = command(
+    process.execPath,
+    [RUNTIME, "--dir", repo, "--resume-session", session.session_id, "range", `${reviewed}..${fixed}`],
+    { cwd: repo, env: reviewEnv(first.logPath), allowFailure: true }
+  );
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /requires a clean working tree/);
+  assert.equal(calls(first.logPath).length, 1);
+  assert.equal(sessions(repo)[0].session.review_count, 1);
+  assert.equal(sessions(repo)[0].session.last_head, reviewed);
+  const jobs = fs.readdirSync(path.join(repo, "tmp", "claude_reviews", "jobs"))
+    .filter((name) => name.endsWith(".json"));
+  assert.equal(jobs.length, 1);
+});
+
+test("unknown and reset sessions fail without invoking Claude or creating a task", () => {
+  const unknownRepo = createRepo();
+  const unknownLog = path.join(unknownRepo, "fake-claude.jsonl");
+  const unknown = command(
+    process.execPath,
+    [RUNTIME, "--dir", unknownRepo, "--resume-session", "missing-session", "repo"],
+    { cwd: unknownRepo, env: reviewEnv(unknownLog), allowFailure: true }
+  );
+  assert.notEqual(unknown.status, 0);
+  assert.match(unknown.stderr, /No Claude review session missing-session exists/);
+  assert.equal(fs.existsSync(unknownLog), false);
+  assert.equal(sessions(unknownRepo).length, 0);
+
+  const resetRepo = createRepo();
+  fs.writeFileSync(path.join(resetRepo, "example.txt"), "changed\n", "utf8");
+  const first = runReview(resetRepo);
+  const sessionId = sessions(resetRepo)[0].session.session_id;
+  runReview(resetRepo, ["reset"]);
+  const reset = command(
+    process.execPath,
+    [RUNTIME, "--dir", resetRepo, "--resume-session", sessionId, "repo"],
+    { cwd: resetRepo, env: reviewEnv(first.logPath), allowFailure: true }
+  );
+  assert.notEqual(reset.status, 0);
+  assert.match(reset.stderr, /is inactive/);
+  assert.equal(calls(first.logPath).length, 1);
+  assert.equal(sessions(resetRepo).length, 1);
+});
+
+test("an explicit session refuses an unrelated unborn checkout", () => {
+  const repo = createRepo();
+  fs.writeFileSync(path.join(repo, "example.txt"), "changed\n", "utf8");
+  const first = runReview(repo);
+  const sessionId = sessions(repo)[0].session.session_id;
+
+  git(repo, "checkout", "--orphan", "unborn-replacement");
+  git(repo, "rm", "-rf", ".");
+  fs.writeFileSync(path.join(repo, "replacement.txt"), "replacement\n", "utf8");
+  const result = command(
+    process.execPath,
+    [RUNTIME, "--dir", repo, "--resume-session", sessionId, "repo"],
+    { cwd: repo, env: reviewEnv(first.logPath), allowFailure: true }
+  );
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /cannot resume on an unborn HEAD/);
+  assert.equal(calls(first.logPath).length, 1);
+  assert.equal(sessions(repo)[0].session.review_count, 1);
+});
+
 test("new creates a fresh session and reset preserves its artifacts", () => {
   const repo = createRepo();
   fs.writeFileSync(path.join(repo, "example.txt"), "changed\n", "utf8");
@@ -204,7 +585,7 @@ test("new creates a fresh session and reset preserves its artifacts", () => {
 test("background review can be observed through status and result", async () => {
   const repo = createRepo();
   fs.writeFileSync(path.join(repo, "example.txt"), "changed\n", "utf8");
-  const logPath = path.join(repo, "fake-claude.jsonl");
+  const logPath = fakeLogPath(repo);
   const started = command(process.execPath, [RUNTIME, "--dir", repo, "working", "--background"], {
     cwd: repo,
     env: reviewEnv(logPath, { FAKE_CLAUDE_DELAY_MS: "150" })
@@ -221,6 +602,67 @@ test("background review can be observed through status and result", async () => 
   assert.match(status, /Status: completed/);
   const result = command(process.execPath, [RUNTIME, "result", id, "--dir", repo]).stdout;
   assert.match(result, /Example defect/);
+});
+
+test("a moving checkout fails the review without advancing its session", async () => {
+  const repo = createRepo();
+  const base = git(repo, "rev-parse", "HEAD");
+  fs.writeFileSync(path.join(repo, "example.txt"), "reviewed\n", "utf8");
+  git(repo, "add", "example.txt");
+  git(repo, "commit", "-m", "reviewed candidate");
+  const reviewed = git(repo, "rev-parse", "HEAD");
+  const logPath = fakeLogPath(repo);
+  runReview(repo, ["range", `${base}..${reviewed}`]);
+  const session = sessions(repo)[0].session;
+
+  fs.writeFileSync(path.join(repo, "example.txt"), "fixed\n", "utf8");
+  git(repo, "add", "example.txt");
+  git(repo, "commit", "-m", "fix review finding");
+  const fixed = git(repo, "rev-parse", "HEAD");
+  const started = command(
+    process.execPath,
+    [
+      RUNTIME,
+      "--dir",
+      repo,
+      "--resume-session",
+      session.session_id,
+      "range",
+      `${reviewed}..${fixed}`,
+      "--background"
+    ],
+    {
+      cwd: repo,
+      env: reviewEnv(logPath, { FAKE_CLAUDE_DELAY_MS: "1500" })
+    }
+  );
+  const id = started.stdout.match(/Claude review job: (\S+)/)?.[1];
+  assert.ok(id);
+
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    if (fs.existsSync(logPath) && calls(logPath).length === 2) break;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  assert.equal(calls(logPath).length, 2);
+  fs.writeFileSync(path.join(repo, "example.txt"), "moved again\n", "utf8");
+  git(repo, "add", "example.txt");
+  git(repo, "commit", "-m", "move checkout during resumed review");
+
+  let status;
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    status = command(process.execPath, [RUNTIME, "status", id, "--dir", repo]).stdout;
+    if (status.includes("Status: failed")) break;
+  }
+  assert.match(status, /Status: failed/);
+  assert.match(status, /Repository HEAD moved during review/);
+  assert.match(status, /Artifact: .*\/failed\//);
+  const artifactPath = status.match(/Artifact: (.+)/)?.[1];
+  assert.ok(artifactPath);
+  assert.match(fs.readFileSync(artifactPath, "utf8"), /Review output \(not applied\)/);
+  assert.match(fs.readFileSync(artifactPath, "utf8"), /Example defect/);
+  assert.equal(sessions(repo)[0].session.review_count, 1);
+  assert.equal(sessions(repo)[0].session.last_head, reviewed);
 });
 
 test("a second review cannot create a stuck job for an active session", async () => {
@@ -242,6 +684,38 @@ test("a second review cannot create a stuck job for an active session", async ()
   assert.match(duplicate.stderr, new RegExp(`job ${id} is already`));
   const jobs = fs.readdirSync(path.join(repo, "tmp", "claude_reviews", "jobs")).filter((name) => name.endsWith(".json"));
   assert.equal(jobs.length, 1);
+  command(process.execPath, [RUNTIME, "cancel", id, "--dir", repo]);
+});
+
+test("an explicit session reports its in-flight focused review instead of starting another", () => {
+  const repo = createRepo();
+  const base = git(repo, "rev-parse", "HEAD");
+  fs.writeFileSync(path.join(repo, "example.txt"), "reviewed\n", "utf8");
+  git(repo, "add", "example.txt");
+  git(repo, "commit", "-m", "reviewed candidate");
+  const reviewed = git(repo, "rev-parse", "HEAD");
+  runReview(repo, ["range", `${base}..${reviewed}`]);
+  const sessionId = sessions(repo)[0].session.session_id;
+
+  fs.writeFileSync(path.join(repo, "example.txt"), "fixed\n", "utf8");
+  git(repo, "add", "example.txt");
+  git(repo, "commit", "-m", "fix review finding");
+  const fixed = git(repo, "rev-parse", "HEAD");
+  const logPath = fakeLogPath(repo);
+  const started = command(
+    process.execPath,
+    [RUNTIME, "--dir", repo, "--resume-session", sessionId, "range", `${reviewed}..${fixed}`, "--background"],
+    { cwd: repo, env: reviewEnv(logPath, { FAKE_CLAUDE_DELAY_MS: "1000" }) }
+  );
+  const id = started.stdout.match(/Claude review job: (\S+)/)?.[1];
+  assert.ok(id);
+  const duplicate = command(
+    process.execPath,
+    [RUNTIME, "--dir", repo, "--resume-session", sessionId, "range", `${reviewed}..${fixed}`],
+    { cwd: repo, env: reviewEnv(logPath), allowFailure: true }
+  );
+  assert.notEqual(duplicate.status, 0);
+  assert.match(duplicate.stderr, new RegExp(`job ${id} is already`));
   command(process.execPath, [RUNTIME, "cancel", id, "--dir", repo]);
 });
 
