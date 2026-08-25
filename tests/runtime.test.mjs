@@ -82,6 +82,16 @@ function sessions(repo) {
     .map((name) => ({ name, directory: path.join(root, name), session: JSON.parse(fs.readFileSync(path.join(root, name, "session.json"), "utf8")) }));
 }
 
+function jobs(repo) {
+  const directory = path.join(repo, "tmp", "claude_reviews", "jobs");
+  return fs.readdirSync(directory)
+    .filter((name) => name.endsWith(".json"))
+    .map((name) => ({
+      path: path.join(directory, name),
+      job: JSON.parse(fs.readFileSync(path.join(directory, name), "utf8"))
+    }));
+}
+
 test.before(() => fs.chmodSync(FAKE_CLAUDE, 0o755));
 
 test("parseArguments defaults to working at max effort", () => {
@@ -180,6 +190,9 @@ test("foreground review creates ignored artifacts and uses hardened max-effort i
 
   const task = sessions(repo)[0];
   assert.equal(task.session.review_count, 1);
+  const completedJob = jobs(repo)[0].job;
+  assert.ok(completedJob.claude_started_at);
+  assert.equal(task.session.last_applied_job_id, completedJob.id);
   assert.ok(fs.readdirSync(task.directory).some((name) => /^001-working\.md$/.test(name)));
   assert.equal(git(repo, "check-ignore", "tmp/claude_reviews/001-probe"), "tmp/claude_reviews/001-probe");
   assert.doesNotMatch(fs.existsSync(path.join(repo, ".gitignore")) ? fs.readFileSync(path.join(repo, ".gitignore"), "utf8") : "", /claude_reviews/);
@@ -849,6 +862,82 @@ test("a stale queued job that crashed before recording a PID self-heals", () => 
   assert.match(stale.error, /worker exited/);
 });
 
+test("a dead worker after Claude starts retires the unapplied session", () => {
+  const repo = createRepo();
+  fs.writeFileSync(path.join(repo, "example.txt"), "changed\n", "utf8");
+  const first = runReview(repo);
+  const accepted = sessions(repo)[0];
+  const acceptedJob = jobs(repo)[0].job;
+  const jobsDirectory = path.join(repo, "tmp", "claude_reviews", "jobs");
+  const stalePath = path.join(jobsDirectory, "review-stale-started.json");
+  fs.writeFileSync(stalePath, `${JSON.stringify({
+    version: 1,
+    id: "review-stale-started",
+    status: "running",
+    pid: 2_147_483_647,
+    created_at: "2999-01-01T00:00:00.000Z",
+    updated_at: "2999-01-01T00:00:00.000Z",
+    claude_started_at: "2999-01-01T00:00:01.000Z",
+    repo_root: accepted.session.repo_root,
+    branch: accepted.session.branch,
+    task_directory: acceptedJob.task_directory,
+    session_id: accepted.session.session_id,
+    scope: { kind: "working" }
+  })}\n`, "utf8");
+
+  const again = command(process.execPath, [RUNTIME, "--dir", repo, "again"], {
+    cwd: repo,
+    env: reviewEnv(first.logPath),
+    allowFailure: true
+  });
+  assert.notEqual(again.status, 0);
+  assert.match(again.stderr, /previous Claude review session.*retired/i);
+  const retired = sessions(repo)[0].session;
+  assert.equal(retired.active, false);
+  assert.equal(retired.retired_job_id, "review-stale-started");
+  const stale = JSON.parse(fs.readFileSync(stalePath, "utf8"));
+  assert.equal(stale.status, "failed");
+  assert.match(stale.error, /session was retired/);
+
+  const replacement = runReview(repo);
+  assert.match(replacement.result.stdout, /Notice: Previous session .* was retired/);
+  const invocations = calls(first.logPath);
+  assert.equal(invocations.length, 2);
+  assert.ok(invocations[1].args.includes("--session-id"));
+  assert.ok(!invocations[1].args.includes("--resume"));
+  const taskEntries = sessions(repo);
+  assert.equal(taskEntries.length, 2);
+  assert.equal(taskEntries[1].session.active, true);
+});
+
+test("a dead worker after applying its result preserves session continuity", () => {
+  const repo = createRepo();
+  fs.writeFileSync(path.join(repo, "example.txt"), "changed\n", "utf8");
+  const first = runReview(repo);
+  const accepted = sessions(repo)[0].session;
+  const completed = jobs(repo).find(({ job }) => job.id === accepted.last_applied_job_id);
+  assert.ok(completed);
+  completed.job.status = "running";
+  completed.job.pid = 2_147_483_647;
+  completed.job.claude_started_at = "2999-01-01T00:00:01.000Z";
+  completed.job.updated_at = "2999-01-01T00:00:01.000Z";
+  fs.writeFileSync(completed.path, `${JSON.stringify(completed.job)}\n`, "utf8");
+
+  const resumed = runReview(repo, ["again"]);
+  assert.match(resumed.result.stdout, /Session: resumed/);
+  assert.doesNotMatch(resumed.result.stdout, /Previous session .* was retired/);
+  const invocations = calls(first.logPath);
+  assert.equal(invocations.length, 2);
+  assert.ok(invocations[1].args.includes("--resume"));
+  assert.equal(invocations[1].sessionId, accepted.session_id);
+  const current = sessions(repo)[0].session;
+  assert.equal(current.active, true);
+  assert.equal(current.review_count, 2);
+  const recovered = JSON.parse(fs.readFileSync(completed.path, "utf8"));
+  assert.equal(recovered.status, "completed");
+  assert.match(recovered.recovery_note, /applied-result marker/);
+});
+
 test("legacy jobs recover a session ID only from a matching session inside the current artifact root", () => {
   const repo = createRepo();
   fs.writeFileSync(path.join(repo, "example.txt"), "changed\n", "utf8");
@@ -993,6 +1082,13 @@ test("cancellation records a consistent cancelled artifact", async () => {
   const task = sessions(repo)[0];
   assert.equal(task.session.active, false);
   assert.ok(task.session.retired_at);
+  const again = command(process.execPath, [RUNTIME, "--dir", repo, "again"], {
+    cwd: repo,
+    env: reviewEnv(logPath),
+    allowFailure: true
+  });
+  assert.notEqual(again.status, 0);
+  assert.match(again.stderr, /previous Claude review session.*retired/i);
 });
 
 test("again without an active review does not leak an empty task", () => {

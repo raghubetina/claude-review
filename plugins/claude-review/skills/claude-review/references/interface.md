@@ -28,12 +28,16 @@ the current HEAD, and target a new scope whose committed tip equals that HEAD. N
 own the destination checkout identity. A successful resume follows the current checkout identity. A sibling linked
 worktree has separate session storage. Pass the ID again after each
 detached HEAD change, and leave that working tree untouched until the resumed review finishes. The runtime samples
-its named-or-detached identity, HEAD, and cleanliness before invoking Claude and before applying the result; it cannot
-detect a transient change restored between those samples. Background execution may overlap work in another checkout.
-If Claude may have advanced but a later check or result application fails, the plugin retires the session while
-preserving its last accepted scope and HEAD. Start a new isolated session over the unapplied delta. Continuity is
-optional and does not require a broader replay. `again` repeats the selected session's previous scope definition; use
-an explicit range for a focused delta. Use `new` when history, review scope, or intended context should not continue.
+its named-or-detached identity, HEAD, and cleanliness before invoking Claude and before applying the result; these
+samples apply only to explicit `--resume-session` reviews, and cannot detect a transient change restored between
+them. Background execution may overlap work in another checkout.
+
+Once a Claude process starts, any error, timeout, cancellation, worker death, checkout mismatch, malformed result,
+or persistence failure that prevents its result from being applied retires the plugin session at its last accepted
+scope and HEAD. Cancellation ends continuity. `again` then reports why it cannot resume, while an ordinary review
+starts a new isolated session and reports the transition. Review the unapplied delta; optional continuity does not
+require a broader replay. `again` normally repeats the selected session's previous scope definition; use an explicit
+range for a focused delta. Use `new` when history, review scope, or intended context should not continue.
 
 Put custom focus or follow-up feedback after `--`:
 
