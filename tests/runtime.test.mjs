@@ -82,6 +82,16 @@ function sessions(repo) {
     .map((name) => ({ name, directory: path.join(root, name), session: JSON.parse(fs.readFileSync(path.join(root, name, "session.json"), "utf8")) }));
 }
 
+function jobs(repo) {
+  const directory = path.join(repo, "tmp", "claude_reviews", "jobs");
+  return fs.readdirSync(directory)
+    .filter((name) => name.endsWith(".json"))
+    .map((name) => ({
+      path: path.join(directory, name),
+      job: JSON.parse(fs.readFileSync(path.join(directory, name), "utf8"))
+    }));
+}
+
 test.before(() => fs.chmodSync(FAKE_CLAUDE, 0o755));
 
 test("parseArguments defaults to working at max effort", () => {
@@ -180,6 +190,9 @@ test("foreground review creates ignored artifacts and uses hardened max-effort i
 
   const task = sessions(repo)[0];
   assert.equal(task.session.review_count, 1);
+  const completedJob = jobs(repo)[0].job;
+  assert.ok(completedJob.claude_started_at);
+  assert.equal(task.session.last_applied_job_id, completedJob.id);
   assert.ok(fs.readdirSync(task.directory).some((name) => /^001-working\.md$/.test(name)));
   assert.equal(git(repo, "check-ignore", "tmp/claude_reviews/001-probe"), "tmp/claude_reviews/001-probe");
   assert.doesNotMatch(fs.existsSync(path.join(repo, ".gitignore")) ? fs.readFileSync(path.join(repo, ".gitignore"), "utf8") : "", /claude_reviews/);
@@ -364,12 +377,27 @@ test("an explicit session rechecks its destination before moving there", async (
   }
   assert.match(status, /Status: failed/);
   assert.match(status, /session late-destination-session is already active/);
+  assert.match(status, /new isolated delta session/);
   const after = sessions(repo);
   const originalAfter = after.find(({ session }) => session.session_id === original.session.session_id);
   assert.equal(originalAfter.session.review_count, 1);
   assert.equal(originalAfter.session.branch, `detached-${reviewed.slice(0, 12)}`);
+  assert.equal(originalAfter.session.last_head, reviewed);
+  assert.equal(originalAfter.session.last_scope.to, reviewed);
+  assert.equal(originalAfter.session.active, false);
+  assert.equal(originalAfter.session.retired_job_id, id);
+  assert.match(originalAfter.session.retired_reason, /new isolated delta session/);
   assert.equal(fs.readdirSync(originalAfter.directory).filter((name) => /^\d{3}-.*\.md$/.test(name)).length, 1);
   assert.equal(after.find(({ session }) => session.session_id === "late-destination-session").session.branch, destination);
+
+  const retry = command(
+    process.execPath,
+    [RUNTIME, "--dir", repo, "--resume-session", original.session.session_id, "range", `${reviewed}..${fixed}`],
+    { cwd: repo, env: reviewEnv(first.logPath), allowFailure: true }
+  );
+  assert.notEqual(retry.status, 0);
+  assert.match(retry.stderr, /was retired.*new isolated delta session/);
+  assert.equal(calls(first.logPath).length, 2);
 });
 
 test("an ordinary review can complete while preparation state is locked", async () => {
@@ -604,7 +632,7 @@ test("background review can be observed through status and result", async () => 
   assert.match(result, /Example defect/);
 });
 
-test("a moving checkout fails the review without advancing its session", async () => {
+test("a moving checkout retires the advanced review without advancing its accepted session", async () => {
   const repo = createRepo();
   const base = git(repo, "rev-parse", "HEAD");
   fs.writeFileSync(path.join(repo, "example.txt"), "reviewed\n", "utf8");
@@ -656,13 +684,98 @@ test("a moving checkout fails the review without advancing its session", async (
   }
   assert.match(status, /Status: failed/);
   assert.match(status, /Repository HEAD moved during review/);
+  assert.match(status, /new isolated delta session/);
   assert.match(status, /Artifact: .*\/failed\//);
   const artifactPath = status.match(/Artifact: (.+)/)?.[1];
   assert.ok(artifactPath);
   assert.match(fs.readFileSync(artifactPath, "utf8"), /Review output \(not applied\)/);
   assert.match(fs.readFileSync(artifactPath, "utf8"), /Example defect/);
-  assert.equal(sessions(repo)[0].session.review_count, 1);
-  assert.equal(sessions(repo)[0].session.last_head, reviewed);
+  const retired = sessions(repo)[0].session;
+  assert.equal(retired.review_count, 1);
+  assert.equal(retired.last_head, reviewed);
+  assert.equal(retired.last_scope.to, reviewed);
+  assert.equal(retired.active, false);
+  assert.equal(retired.retired_job_id, id);
+  assert.match(retired.retired_reason, /new isolated delta session/);
+});
+
+test("an ordinary resumed failure retires the session without advancing its accepted state", () => {
+  const repo = createRepo();
+  fs.writeFileSync(path.join(repo, "example.txt"), "reviewed\n", "utf8");
+  runReview(repo);
+  const accepted = structuredClone(sessions(repo)[0].session);
+
+  const { result } = runReview(repo, ["again"], { FAKE_CLAUDE_FAIL: "1" });
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /new isolated delta session/);
+
+  const retired = sessions(repo)[0].session;
+  assert.equal(retired.active, false);
+  assert.equal(retired.review_count, accepted.review_count);
+  assert.deepEqual(retired.last_scope, accepted.last_scope);
+  assert.equal(retired.last_head, accepted.last_head);
+  assert.ok(retired.retired_job_id);
+  assert.match(retired.retired_reason, /new isolated delta session/);
+});
+
+test("a same-SHA named-to-detached checkout change retires an explicit resumed session", async () => {
+  const repo = createRepo();
+  const base = git(repo, "rev-parse", "HEAD");
+  fs.writeFileSync(path.join(repo, "example.txt"), "reviewed\n", "utf8");
+  git(repo, "add", "example.txt");
+  git(repo, "commit", "-m", "reviewed candidate");
+  const reviewed = git(repo, "rev-parse", "HEAD");
+  const first = runReview(repo, ["range", `${base}..${reviewed}`]);
+  const accepted = sessions(repo)[0].session;
+
+  fs.writeFileSync(path.join(repo, "example.txt"), "fixed\n", "utf8");
+  git(repo, "add", "example.txt");
+  git(repo, "commit", "-m", "fix review finding");
+  const fixed = git(repo, "rev-parse", "HEAD");
+  const started = command(
+    process.execPath,
+    [
+      RUNTIME,
+      "--dir",
+      repo,
+      "--resume-session",
+      accepted.session_id,
+      "range",
+      `${reviewed}..${fixed}`,
+      "--background"
+    ],
+    {
+      cwd: repo,
+      env: reviewEnv(first.logPath, { FAKE_CLAUDE_DELAY_MS: "1500" })
+    }
+  );
+  const id = started.stdout.match(/Claude review job: (\S+)/)?.[1];
+  assert.ok(id);
+
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    if (calls(first.logPath).length === 2) break;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  assert.equal(calls(first.logPath).length, 2);
+  git(repo, "checkout", "--detach", fixed);
+  assert.equal(git(repo, "rev-parse", "HEAD"), fixed);
+
+  let status;
+  for (let attempt = 0; attempt < 60; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    status = command(process.execPath, [RUNTIME, "status", id, "--dir", repo]).stdout;
+    if (status.includes("Status: failed")) break;
+  }
+  assert.match(status, /Status: failed/);
+  assert.match(status, /Repository checkout identity changed during review: expected main, found detached-/);
+  assert.match(status, /new isolated delta session/);
+  const retired = sessions(repo)[0].session;
+  assert.equal(retired.branch, "main");
+  assert.equal(retired.review_count, 1);
+  assert.equal(retired.last_head, reviewed);
+  assert.equal(retired.last_scope.to, reviewed);
+  assert.equal(retired.active, false);
+  assert.equal(retired.retired_job_id, id);
 });
 
 test("a second review cannot create a stuck job for an active session", async () => {
@@ -737,14 +850,256 @@ test("a stale queued job that crashed before recording a PID self-heals", () => 
     pid: null,
     created_at: "2000-01-01T00:00:00.000Z",
     updated_at: "2000-01-01T00:00:00.000Z",
-    repo_root: repo,
+    repo_root: originalJob.repo_root,
     task_directory: originalJob.task_directory,
     scope: { kind: "working" }
   })}\n`, "utf8");
+  const legacyStatus = command(process.execPath, [RUNTIME, "status", "review-stale", "--dir", repo]).stdout;
+  assert.match(legacyStatus, new RegExp(`Session ID: ${task.session.session_id}`));
   runReview(repo, ["again"]);
   const stale = JSON.parse(fs.readFileSync(stalePath, "utf8"));
   assert.equal(stale.status, "failed");
   assert.match(stale.error, /worker exited/);
+});
+
+test("a dead worker after Claude starts retires the unapplied session", () => {
+  const repo = createRepo();
+  fs.writeFileSync(path.join(repo, "example.txt"), "changed\n", "utf8");
+  const first = runReview(repo);
+  const accepted = sessions(repo)[0];
+  const acceptedJob = jobs(repo)[0].job;
+  const jobsDirectory = path.join(repo, "tmp", "claude_reviews", "jobs");
+  const stalePath = path.join(jobsDirectory, "review-stale-started.json");
+  fs.writeFileSync(stalePath, `${JSON.stringify({
+    version: 1,
+    id: "review-stale-started",
+    status: "running",
+    pid: 2_147_483_647,
+    created_at: "2999-01-01T00:00:00.000Z",
+    updated_at: "2999-01-01T00:00:00.000Z",
+    claude_started_at: "2999-01-01T00:00:01.000Z",
+    repo_root: accepted.session.repo_root,
+    branch: accepted.session.branch,
+    task_directory: acceptedJob.task_directory,
+    session_id: accepted.session.session_id,
+    scope: { kind: "working" },
+    completed_at: "2000-01-01T00:00:00.000Z",
+    artifact: path.join(acceptedJob.task_directory, "002-working.md"),
+    result_summary: "Unapplied summary",
+    rendered_result: "Unapplied result"
+  })}\n`, "utf8");
+
+  const again = command(process.execPath, [RUNTIME, "--dir", repo, "again"], {
+    cwd: repo,
+    env: reviewEnv(first.logPath),
+    allowFailure: true
+  });
+  assert.notEqual(again.status, 0);
+  assert.match(again.stderr, /previous Claude review session.*retired/i);
+  const retired = sessions(repo)[0].session;
+  assert.equal(retired.active, false);
+  assert.equal(retired.retired_job_id, "review-stale-started");
+  const stale = JSON.parse(fs.readFileSync(stalePath, "utf8"));
+  assert.equal(stale.status, "failed");
+  assert.match(stale.error, /session was retired/);
+  assert.equal(stale.artifact, null);
+  assert.equal(stale.result_summary, null);
+  assert.equal(stale.rendered_result, null);
+  assert.match(stale.unapplied_artifact, /002-working\.md$/);
+  assert.notEqual(stale.completed_at, "2000-01-01T00:00:00.000Z");
+
+  const replacement = runReview(repo);
+  assert.match(replacement.result.stdout, /Notice: Previous session .* was retired/);
+  const invocations = calls(first.logPath);
+  assert.equal(invocations.length, 2);
+  assert.ok(invocations[1].args.includes("--session-id"));
+  assert.ok(!invocations[1].args.includes("--resume"));
+  const taskEntries = sessions(repo);
+  assert.equal(taskEntries.length, 2);
+  assert.equal(taskEntries[1].session.active, true);
+});
+
+test("an explicit resume refuses a stale session retired during preparation", () => {
+  const repo = createRepo();
+  const base = git(repo, "rev-parse", "HEAD");
+  fs.writeFileSync(path.join(repo, "example.txt"), "reviewed\n", "utf8");
+  git(repo, "add", "example.txt");
+  git(repo, "commit", "-m", "reviewed candidate");
+  const reviewed = git(repo, "rev-parse", "HEAD");
+  const first = runReview(repo, ["range", `${base}..${reviewed}`]);
+  const accepted = sessions(repo)[0].session;
+  const acceptedJob = jobs(repo)[0].job;
+
+  fs.writeFileSync(path.join(repo, "example.txt"), "fixed\n", "utf8");
+  git(repo, "add", "example.txt");
+  git(repo, "commit", "-m", "fix review finding");
+  const fixed = git(repo, "rev-parse", "HEAD");
+  const stalePath = path.join(repo, "tmp", "claude_reviews", "jobs", "review-stale-explicit.json");
+  fs.writeFileSync(stalePath, `${JSON.stringify({
+    version: 1,
+    id: "review-stale-explicit",
+    status: "running",
+    pid: 2_147_483_647,
+    created_at: "2999-01-01T00:00:00.000Z",
+    updated_at: "2999-01-01T00:00:00.000Z",
+    claude_started_at: "2999-01-01T00:00:01.000Z",
+    repo_root: acceptedJob.repo_root,
+    branch: accepted.branch,
+    task_directory: acceptedJob.task_directory,
+    session_id: accepted.session_id,
+    scope: { kind: "range", from: reviewed, to: fixed }
+  })}\n`, "utf8");
+
+  const resumed = command(
+    process.execPath,
+    [
+      RUNTIME,
+      "--dir",
+      repo,
+      "--resume-session",
+      accepted.session_id,
+      "range",
+      `${reviewed}..${fixed}`
+    ],
+    { cwd: repo, env: reviewEnv(first.logPath), allowFailure: true }
+  );
+  assert.notEqual(resumed.status, 0);
+  assert.match(resumed.stderr, new RegExp(`session ${accepted.session_id} was retired`));
+  assert.equal(calls(first.logPath).length, 1);
+  const taskEntries = sessions(repo);
+  assert.equal(taskEntries.length, 1);
+  assert.equal(taskEntries[0].session.active, false);
+  assert.equal(taskEntries[0].session.retired_job_id, "review-stale-explicit");
+});
+
+test("a dead worker after applying its result preserves session continuity", () => {
+  const repo = createRepo();
+  fs.writeFileSync(path.join(repo, "example.txt"), "changed\n", "utf8");
+  const first = runReview(repo);
+  const accepted = sessions(repo)[0].session;
+  const completed = jobs(repo).find(({ job }) => job.id === accepted.last_applied_job_id);
+  assert.ok(completed);
+  completed.job.status = "running";
+  completed.job.pid = 2_147_483_647;
+  completed.job.claude_started_at = "2999-01-01T00:00:01.000Z";
+  completed.job.updated_at = "2999-01-01T00:00:01.000Z";
+  fs.writeFileSync(completed.path, `${JSON.stringify(completed.job)}\n`, "utf8");
+
+  const resumed = runReview(repo, ["again"]);
+  assert.match(resumed.result.stdout, /Session: resumed/);
+  assert.doesNotMatch(resumed.result.stdout, /Previous session .* was retired/);
+  const invocations = calls(first.logPath);
+  assert.equal(invocations.length, 2);
+  assert.ok(invocations[1].args.includes("--resume"));
+  assert.equal(invocations[1].sessionId, accepted.session_id);
+  const current = sessions(repo)[0].session;
+  assert.equal(current.active, true);
+  assert.equal(current.review_count, 2);
+  const recovered = JSON.parse(fs.readFileSync(completed.path, "utf8"));
+  assert.equal(recovered.status, "completed");
+  assert.match(recovered.recovery_note, /applied-result marker/);
+});
+
+test("legacy jobs recover a session ID only from a matching session inside the current artifact root", () => {
+  const repo = createRepo();
+  fs.writeFileSync(path.join(repo, "example.txt"), "changed\n", "utf8");
+  runReview(repo);
+  const canonicalRepo = sessions(repo)[0].session.repo_root;
+  const root = path.join(repo, "tmp", "claude_reviews");
+  const jobsDirectory = path.join(root, "jobs");
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), "claude-review-outside-"));
+  fs.writeFileSync(path.join(outside, "session.json"), `${JSON.stringify({
+    version: 1,
+    session_id: "outside-session",
+    repo_root: canonicalRepo,
+    branch: "main",
+    active: true
+  })}\n`, "utf8");
+  const linkedTask = path.join(root, "999-outside");
+  fs.symlinkSync(outside, linkedTask, "dir");
+  fs.writeFileSync(path.join(jobsDirectory, "review-legacy-outside.json"), `${JSON.stringify({
+    version: 1,
+    id: "review-legacy-outside",
+    status: "completed",
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+    repo_root: canonicalRepo,
+    task_directory: linkedTask,
+    scope: { kind: "working" }
+  })}\n`, "utf8");
+
+  const status = command(
+    process.execPath,
+    [RUNTIME, "status", "review-legacy-outside", "--dir", repo]
+  ).stdout;
+  assert.match(status, /Session ID: unknown/);
+  assert.doesNotMatch(status, /outside-session/);
+
+  const canonicalTask = sessions(repo)[0];
+  const linkedInsideTask = path.join(root, "996-inside-link");
+  fs.symlinkSync(canonicalTask.directory, linkedInsideTask, "dir");
+  fs.writeFileSync(path.join(jobsDirectory, "review-legacy-inside-link.json"), `${JSON.stringify({
+    version: 1,
+    id: "review-legacy-inside-link",
+    status: "completed",
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+    repo_root: canonicalRepo,
+    task_directory: linkedInsideTask,
+    scope: { kind: "working" }
+  })}\n`, "utf8");
+  const linkedInsideStatus = command(
+    process.execPath,
+    [RUNTIME, "status", "review-legacy-inside-link", "--dir", repo]
+  ).stdout;
+  assert.match(linkedInsideStatus, /Session ID: unknown/);
+  assert.doesNotMatch(linkedInsideStatus, new RegExp(canonicalTask.session.session_id));
+
+  const insideTask = path.join(root, "998-linked-session");
+  fs.mkdirSync(insideTask);
+  fs.symlinkSync(path.join(outside, "session.json"), path.join(insideTask, "session.json"));
+  fs.writeFileSync(path.join(jobsDirectory, "review-legacy-linked-file.json"), `${JSON.stringify({
+    version: 1,
+    id: "review-legacy-linked-file",
+    status: "completed",
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+    repo_root: canonicalRepo,
+    task_directory: insideTask,
+    scope: { kind: "working" }
+  })}\n`, "utf8");
+  const linkedFileStatus = command(
+    process.execPath,
+    [RUNTIME, "status", "review-legacy-linked-file", "--dir", repo]
+  ).stdout;
+  assert.match(linkedFileStatus, /Session ID: unknown/);
+  assert.doesNotMatch(linkedFileStatus, /outside-session/);
+
+  const mismatchedTask = path.join(root, "997-mismatched-repository");
+  fs.mkdirSync(mismatchedTask);
+  fs.writeFileSync(path.join(mismatchedTask, "session.json"), `${JSON.stringify({
+    version: 1,
+    session_id: "mismatched-session",
+    repo_root: `${canonicalRepo}-other`,
+    branch: "main",
+    active: true
+  })}\n`, "utf8");
+  fs.writeFileSync(path.join(jobsDirectory, "review-legacy-mismatched.json"), `${JSON.stringify({
+    version: 1,
+    id: "review-legacy-mismatched",
+    status: "completed",
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+    repo_root: canonicalRepo,
+    task_directory: mismatchedTask,
+    scope: { kind: "working" }
+  })}\n`, "utf8");
+  const mismatchedStatus = command(
+    process.execPath,
+    [RUNTIME, "status", "review-legacy-mismatched", "--dir", repo]
+  ).stdout;
+  assert.match(mismatchedStatus, /Session ID: unknown/);
+  assert.doesNotMatch(mismatchedStatus, /mismatched-session/);
 });
 
 test("large tracked diffs are truncated instead of failing the review", { timeout: 30_000 }, () => {
@@ -780,11 +1135,44 @@ test("cancellation records a consistent cancelled artifact", async () => {
     if (job.status === "cancelled" && job.artifact) break;
   }
   assert.equal(job.status, "cancelled");
-  assert.equal(job.error, "Cancelled by user.");
+  assert.match(job.error, /^Cancelled by user\./);
+  assert.match(job.error, /session was retired/);
   assert.ok(job.artifact);
   const artifact = fs.readFileSync(job.artifact, "utf8");
   assert.match(artifact, /Status: cancelled/);
   assert.match(artifact, /Cancelled by user/);
+  const task = sessions(repo)[0];
+  assert.equal(task.session.active, false);
+  assert.ok(task.session.retired_at);
+  const again = command(process.execPath, [RUNTIME, "--dir", repo, "again"], {
+    cwd: repo,
+    env: reviewEnv(logPath),
+    allowFailure: true
+  });
+  assert.notEqual(again.status, 0);
+  assert.match(again.stderr, /previous Claude review session.*retired/i);
+});
+
+test("a newer reset is not misreported as an older retirement", () => {
+  const repo = createRepo();
+  fs.writeFileSync(path.join(repo, "example.txt"), "changed\n", "utf8");
+  const failed = runReview(repo, [], { FAKE_CLAUDE_FAIL: "1" });
+  assert.notEqual(failed.result.status, 0);
+  const replacement = runReview(repo);
+  assert.match(replacement.result.stdout, /Previous session .* was retired/);
+  command(process.execPath, [RUNTIME, "--dir", repo, "reset"], { cwd: repo });
+
+  const again = command(process.execPath, [RUNTIME, "--dir", repo, "again"], {
+    cwd: repo,
+    env: reviewEnv(failed.logPath),
+    allowFailure: true
+  });
+  assert.notEqual(again.status, 0);
+  assert.match(again.stderr, /No active Claude review session/);
+  assert.doesNotMatch(again.stderr, /retired/);
+
+  const afterReset = runReview(repo);
+  assert.doesNotMatch(afterReset.result.stdout, /Previous session .* was retired/);
 });
 
 test("again without an active review does not leak an empty task", () => {
@@ -833,6 +1221,9 @@ test("Claude failures produce a failed artifact and actionable status", () => {
   const { result } = runReview(repo, [], { FAKE_CLAUDE_FAIL: "1" });
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, /simulated Claude failure/);
+  assert.match(result.stderr, /session was retired/);
   const task = sessions(repo)[0];
   assert.ok(fs.existsSync(path.join(task.directory, "failed")));
+  assert.equal(task.session.active, false);
+  assert.ok(task.session.retired_at);
 });
