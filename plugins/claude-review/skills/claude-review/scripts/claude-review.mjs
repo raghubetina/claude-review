@@ -393,9 +393,20 @@ function activeSession(root, branch) {
 }
 
 function latestRetiredSession(root, branch) {
-  return loadSessions(root)
-    .filter(({ session }) => !session.active && session.retired_at && session.branch === branch)
-    .sort((left, right) => String(right.session.retired_at).localeCompare(String(left.session.retired_at)))[0] ?? null;
+  const latestDeactivation = loadSessions(root)
+    .filter(({ session }) => !session.active && session.branch === branch)
+    .map((entry) => ({
+      ...entry,
+      deactivatedAt: [entry.session.retired_at, entry.session.reset_at].filter(Boolean).sort().at(-1) ?? ""
+    }))
+    .sort((left, right) => right.deactivatedAt.localeCompare(left.deactivatedAt))[0] ?? null;
+  if (
+    !latestDeactivation?.session.retired_at ||
+    latestDeactivation.session.reset_at >= latestDeactivation.session.retired_at
+  ) {
+    return null;
+  }
+  return latestDeactivation;
 }
 
 function retiredSessionGuidance(branch) {
@@ -781,14 +792,23 @@ async function prepareJob(parsed, repoRoot, root) {
         if ((existingJob.pid && !processAlive(existingJob.pid)) || staleBeforePid) {
           const resultWasApplied = entry.session.last_applied_job_id === existingJob.id;
           existingJob.status = resultWasApplied ? "completed" : "failed";
-          existingJob.completed_at ??= entry.session.last_reviewed_at ?? new Date().toISOString();
+          existingJob.completed_at = resultWasApplied
+            ? existingJob.completed_at ?? entry.session.last_reviewed_at ?? new Date().toISOString()
+            : new Date().toISOString();
           existingJob.error = resultWasApplied ? null : "The review worker exited before recording a terminal result.";
           existingJob.recovery_note = resultWasApplied
             ? "Recovered the completed job from the session's applied-result marker."
             : null;
+          if (!resultWasApplied) {
+            existingJob.unapplied_artifact = existingJob.artifact ?? null;
+            existingJob.artifact = null;
+            existingJob.rendered_result = null;
+            existingJob.result_summary = null;
+          }
           existingJob.pid = null;
           saveJob(root, existingJob);
           if (existingJob.claude_started_at && !resultWasApplied) {
+            const retiredSessionId = entry.session.session_id;
             retireSessionAfterUnappliedInvocation(entry.directory, entry.session, existingJob.id);
             existingJob.error = `${existingJob.error} ${RETIRED_SESSION_GUIDANCE}`;
             saveJob(root, existingJob);
@@ -797,6 +817,11 @@ async function prepareJob(parsed, repoRoot, root) {
               session: readJson(path.join(entry.directory, "session.json"))
             };
             entry = null;
+            if (explicitlySelected) {
+              throw new Error(
+                `Claude review session ${retiredSessionId} was retired after an unapplied Claude invocation. Start a new isolated delta session instead.`
+              );
+            }
             if (parsed.action === "again") throw new Error(retiredSessionGuidance(branch));
           }
         } else {
@@ -1134,6 +1159,7 @@ async function invokeClaude(job, session, onSpawn = () => {}) {
     try {
       onSpawn();
     } catch (error) {
+      child.stdin.destroy();
       child.kill("SIGTERM");
       fail(error);
       return;

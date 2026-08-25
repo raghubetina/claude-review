@@ -882,7 +882,11 @@ test("a dead worker after Claude starts retires the unapplied session", () => {
     branch: accepted.session.branch,
     task_directory: acceptedJob.task_directory,
     session_id: accepted.session.session_id,
-    scope: { kind: "working" }
+    scope: { kind: "working" },
+    completed_at: "2000-01-01T00:00:00.000Z",
+    artifact: path.join(acceptedJob.task_directory, "002-working.md"),
+    result_summary: "Unapplied summary",
+    rendered_result: "Unapplied result"
   })}\n`, "utf8");
 
   const again = command(process.execPath, [RUNTIME, "--dir", repo, "again"], {
@@ -898,6 +902,11 @@ test("a dead worker after Claude starts retires the unapplied session", () => {
   const stale = JSON.parse(fs.readFileSync(stalePath, "utf8"));
   assert.equal(stale.status, "failed");
   assert.match(stale.error, /session was retired/);
+  assert.equal(stale.artifact, null);
+  assert.equal(stale.result_summary, null);
+  assert.equal(stale.rendered_result, null);
+  assert.match(stale.unapplied_artifact, /002-working\.md$/);
+  assert.notEqual(stale.completed_at, "2000-01-01T00:00:00.000Z");
 
   const replacement = runReview(repo);
   assert.match(replacement.result.stdout, /Notice: Previous session .* was retired/);
@@ -908,6 +917,59 @@ test("a dead worker after Claude starts retires the unapplied session", () => {
   const taskEntries = sessions(repo);
   assert.equal(taskEntries.length, 2);
   assert.equal(taskEntries[1].session.active, true);
+});
+
+test("an explicit resume refuses a stale session retired during preparation", () => {
+  const repo = createRepo();
+  const base = git(repo, "rev-parse", "HEAD");
+  fs.writeFileSync(path.join(repo, "example.txt"), "reviewed\n", "utf8");
+  git(repo, "add", "example.txt");
+  git(repo, "commit", "-m", "reviewed candidate");
+  const reviewed = git(repo, "rev-parse", "HEAD");
+  const first = runReview(repo, ["range", `${base}..${reviewed}`]);
+  const accepted = sessions(repo)[0].session;
+  const acceptedJob = jobs(repo)[0].job;
+
+  fs.writeFileSync(path.join(repo, "example.txt"), "fixed\n", "utf8");
+  git(repo, "add", "example.txt");
+  git(repo, "commit", "-m", "fix review finding");
+  const fixed = git(repo, "rev-parse", "HEAD");
+  const stalePath = path.join(repo, "tmp", "claude_reviews", "jobs", "review-stale-explicit.json");
+  fs.writeFileSync(stalePath, `${JSON.stringify({
+    version: 1,
+    id: "review-stale-explicit",
+    status: "running",
+    pid: 2_147_483_647,
+    created_at: "2999-01-01T00:00:00.000Z",
+    updated_at: "2999-01-01T00:00:00.000Z",
+    claude_started_at: "2999-01-01T00:00:01.000Z",
+    repo_root: acceptedJob.repo_root,
+    branch: accepted.branch,
+    task_directory: acceptedJob.task_directory,
+    session_id: accepted.session_id,
+    scope: { kind: "range", from: reviewed, to: fixed }
+  })}\n`, "utf8");
+
+  const resumed = command(
+    process.execPath,
+    [
+      RUNTIME,
+      "--dir",
+      repo,
+      "--resume-session",
+      accepted.session_id,
+      "range",
+      `${reviewed}..${fixed}`
+    ],
+    { cwd: repo, env: reviewEnv(first.logPath), allowFailure: true }
+  );
+  assert.notEqual(resumed.status, 0);
+  assert.match(resumed.stderr, new RegExp(`session ${accepted.session_id} was retired`));
+  assert.equal(calls(first.logPath).length, 1);
+  const taskEntries = sessions(repo);
+  assert.equal(taskEntries.length, 1);
+  assert.equal(taskEntries[0].session.active, false);
+  assert.equal(taskEntries[0].session.retired_job_id, "review-stale-explicit");
 });
 
 test("a dead worker after applying its result preserves session continuity", () => {
@@ -1089,6 +1151,28 @@ test("cancellation records a consistent cancelled artifact", async () => {
   });
   assert.notEqual(again.status, 0);
   assert.match(again.stderr, /previous Claude review session.*retired/i);
+});
+
+test("a newer reset is not misreported as an older retirement", () => {
+  const repo = createRepo();
+  fs.writeFileSync(path.join(repo, "example.txt"), "changed\n", "utf8");
+  const failed = runReview(repo, [], { FAKE_CLAUDE_FAIL: "1" });
+  assert.notEqual(failed.result.status, 0);
+  const replacement = runReview(repo);
+  assert.match(replacement.result.stdout, /Previous session .* was retired/);
+  command(process.execPath, [RUNTIME, "--dir", repo, "reset"], { cwd: repo });
+
+  const again = command(process.execPath, [RUNTIME, "--dir", repo, "again"], {
+    cwd: repo,
+    env: reviewEnv(failed.logPath),
+    allowFailure: true
+  });
+  assert.notEqual(again.status, 0);
+  assert.match(again.stderr, /No active Claude review session/);
+  assert.doesNotMatch(again.stderr, /retired/);
+
+  const afterReset = runReview(repo);
+  assert.doesNotMatch(afterReset.result.stdout, /Previous session .* was retired/);
 });
 
 test("again without an active review does not leak an empty task", () => {

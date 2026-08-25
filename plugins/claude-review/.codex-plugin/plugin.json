@@ -1,6 +1,6 @@
 {
   "name": "claude-review",
-  "version": "0.1.0+codex.20260825163214",
+  "version": "0.1.0+codex.20260825173118",
   "description": "Review working changes, branches, commits, ranges, or repositories with Claude from Codex.",
   "author": {
     "name": "Raghu Betina",
