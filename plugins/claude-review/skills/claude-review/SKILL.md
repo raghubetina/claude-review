@@ -44,8 +44,12 @@ node "$SKILL_DIR/scripts/claude-review.mjs" result --dir /path/to/repo
 - Use `new` for a fresh session, `again` for the previous scope, and `reset` to forget the active session without deleting artifacts.
 - For a focused fix after a detached review, pass `--resume-session` again with the exact prior-to-current range;
   `again` repeats the previous scope definition instead of deriving that delta.
-- Keep the selected working-tree root untouched until an exact resumed review finishes. A background review may
-  overlap work in another checkout, but fails closed if its own checkout changes.
+- Treat continuity as optional. If a Claude invocation may have advanced but a later checkout check or result
+  application fails, the runtime retires that plugin session while preserving its last accepted scope and HEAD. Start
+  a new isolated session over the unapplied delta; do not broaden the scope merely to recreate reviewer context.
+- Keep the selected working-tree root untouched while a resumed review runs. The runtime samples its named-or-detached
+  identity, HEAD, and cleanliness before invoking Claude and before applying the result; a transient change restored
+  between those samples cannot be detected. A background review may overlap work in another checkout.
 - Forward later user decisions as focus text so Claude receives them in its transcript.
 - Choose foreground or background execution from the workflow. Prefer foreground when the result gates the current
   action; prefer background when useful independent work can continue or the review is likely to take a long time;

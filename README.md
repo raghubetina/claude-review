@@ -1,6 +1,6 @@
 # Claude Review
 
-Ask Claude Code to review exact Git scopes from Codex. Reviews are read-only, default to maximum reasoning effort, can run in the background, and resume the same Claude session as code changes.
+Ask Claude Code to review exact Git scopes from Codex. Reviews are read-only, default to maximum reasoning effort, can run in the background, and can optionally resume the same Claude session as code changes.
 
 ## Requirements
 
@@ -49,8 +49,11 @@ the same recorded commit tip, that tip must remain an ancestor of the current HE
 match the current HEAD. No other active session may already own the destination checkout identity. A successful
 resume follows the current checkout identity. Session artifacts belong to one
 working-tree root, so pass the ID again after each detached HEAD change and run the focused range from that same root.
-Keep that working tree untouched until an exact resumed review finishes; a background review may overlap work in a
-different checkout, but fails closed if its own checkout changes.
+The runtime samples that checkout's named-or-detached identity, HEAD, and cleanliness before invoking Claude and
+again before applying the result. Leave it untouched while the review runs; a transient change restored between
+those samples cannot be detected. If Claude may have advanced the transcript but a later check or result application
+fails, the plugin retires that session and preserves its last accepted scope and HEAD. Start a new isolated session
+over the unapplied delta instead. Session continuity is optional; losing it does not require replaying a broader scope.
 `new` starts a fresh session, and `reset` forgets the active session without deleting its artifacts.
 
 Background reviews support `status`, `result`, and `cancel`.
@@ -72,8 +75,9 @@ npm test
 ```
 
 The test suite uses disposable Git repositories and a fake Claude executable. It covers scope resolution, automatic
-and explicit session resumption, advancing detached review worktrees, background jobs, cancellation, stale-job
-recovery, large diffs, history replacement, failures, and safe invocation arguments.
+and explicit session resumption, advancing detached review worktrees, same-SHA checkout identity changes, retired
+sessions, background jobs, cancellation, legacy and stale-job recovery, large diffs, history replacement, failures,
+and safe invocation arguments.
 
 After installing a development build, verify real cached-skill discovery from a fresh Codex process without starting a Claude review:
 

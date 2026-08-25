@@ -20,6 +20,8 @@ const LOCK_STALE_MS = 12 * 60 * 60 * 1000;
 const EFFORT_LEVELS = new Set(["low", "medium", "high", "xhigh", "max"]);
 const SCOPES = new Set(["working", "branch", "commit", "range", "repo"]);
 const ACTIONS = new Set(["again", "new", "reset", "status", "result", "cancel", "help"]);
+const RETIRED_SESSION_GUIDANCE =
+  "The Claude transcript may have advanced, so this plugin session was retired. Start a new isolated delta session instead of resuming it.";
 
 export const REVIEW_SCHEMA = {
   type: "object",
@@ -414,9 +416,23 @@ function sessionById(root, repoRoot, sessionId) {
     throw new Error(`Claude review session ${sessionId} belongs to another repository.`);
   }
   if (!entry.session.active) {
+    if (entry.session.retired_at) {
+      throw new Error(`Claude review session ${sessionId} was retired after a Claude result could not be applied. Start a new isolated delta session instead.`);
+    }
     throw new Error(`Claude review session ${sessionId} is inactive; start a new review instead.`);
   }
   return entry;
+}
+
+function retireSessionAfterUnappliedInvocation(taskDirectory, acceptedSession, jobId) {
+  const retired = {
+    ...acceptedSession,
+    active: false,
+    retired_at: new Date().toISOString(),
+    retired_job_id: jobId,
+    retired_reason: RETIRED_SESSION_GUIDANCE
+  };
+  saveSession(taskDirectory, retired);
 }
 
 function processAlive(pid) {
@@ -766,8 +782,11 @@ async function prepareJob(parsed, repoRoot, root) {
       parsed.options.includeWorking,
       entry.session.last_scope
     );
-    if (headCommit(repoRoot) !== preparedHead) {
-      throw new Error("Repository HEAD moved while resolving the review scope.");
+    if (
+      headCommit(repoRoot) !== preparedHead ||
+      (explicitlySelected && currentBranchIdentity(repoRoot) !== branch)
+    ) {
+      throw new Error("Repository checkout identity or HEAD moved while resolving the review scope.");
     }
     const reviewedTip = scopeTip(scope);
     if (explicitlySelected && scope.kind === "working") {
@@ -808,6 +827,7 @@ async function prepareJob(parsed, repoRoot, root) {
       updated_at: new Date().toISOString(),
       repo_root: repoRoot,
       branch,
+      checkout_identity: branch,
       checkout_head: preparedHead,
       reviewed_tip: reviewedTip,
       task_directory: entry.directory,
@@ -1007,7 +1027,7 @@ function checkClaudeVersion(binary) {
 
 let activeClaudeChild = null;
 
-async function invokeClaude(job, session) {
+async function invokeClaude(job, session, onSpawn = () => {}) {
   const binary = claudeBinary();
   const claudeVersion = checkClaudeVersion(binary);
   const args = [
@@ -1033,6 +1053,7 @@ async function invokeClaude(job, session) {
       env: process.env,
       stdio: ["pipe", "pipe", "pipe"]
     });
+    onSpawn();
     activeClaudeChild = child;
     let stdout = "";
     let stderr = "";
@@ -1178,6 +1199,13 @@ ${body}
 }
 
 function assertPreparedCheckout(job) {
+  const expectedIdentity = job.checkout_identity ?? job.branch;
+  const currentIdentity = currentBranchIdentity(job.repo_root);
+  if (currentIdentity !== expectedIdentity) {
+    throw new Error(
+      `Repository checkout identity changed during review: expected ${expectedIdentity}, found ${currentIdentity}.`
+    );
+  }
   const current = headCommit(job.repo_root);
   if (current !== (job.checkout_head ?? null)) {
     throw new Error(
@@ -1198,11 +1226,15 @@ async function executeJob(root, job) {
     const sessionPath = path.join(job.task_directory, "session.json");
     const session = readJson(sessionPath);
     if (!session) throw new Error(`Missing session metadata: ${sessionPath}`);
+    const acceptedSession = structuredClone(session);
     let invocation = null;
     let parsedOutput = null;
+    let claudeInvocationStarted = false;
     try {
       if (job.explicit_resume) assertPreparedCheckout(job);
-      invocation = await invokeClaude(job, session);
+      invocation = await invokeClaude(job, session, () => {
+        claudeInvocationStarted = true;
+      });
       parsedOutput = parseClaudeOutput(invocation.stdout);
       if (parsedOutput.sessionId && parsedOutput.sessionId !== session.session_id) {
         throw new Error(`Claude returned unexpected session ID ${parsedOutput.sessionId}; expected ${session.session_id}.`);
@@ -1238,7 +1270,13 @@ async function executeJob(root, job) {
       return job;
     } catch (error) {
       const cancelled = job.status === "cancelled";
-      const persistedError = cancelled ? (job.error || "Cancelled by user.") : error.message;
+      const failure = cancelled ? (job.error || "Cancelled by user.") : error.message;
+      const persistedError = claudeInvocationStarted
+        ? `${failure} ${RETIRED_SESSION_GUIDANCE}`
+        : failure;
+      if (claudeInvocationStarted) {
+        retireSessionAfterUnappliedInvocation(job.task_directory, acceptedSession, job.id);
+      }
       const failedDirectory = path.join(job.task_directory, "failed");
       fs.mkdirSync(failedDirectory, { recursive: true });
       const failedArtifact = path.join(failedDirectory, `${job.id}.md`);
@@ -1252,19 +1290,53 @@ async function executeJob(root, job) {
       job.artifact = failedArtifact;
       job.pid = null;
       saveJob(root, job);
+      if (claudeInvocationStarted) throw new Error(persistedError);
       throw error;
     }
   });
 }
 
-function renderJob(job, includeResult = false) {
+function jobSessionId(root, job) {
+  if (typeof job.session_id === "string" && job.session_id) return job.session_id;
+  if (
+    typeof job.repo_root !== "string" ||
+    !job.repo_root ||
+    typeof job.task_directory !== "string" ||
+    !job.task_directory
+  ) {
+    return null;
+  }
+  try {
+    const resolvedRoot = fs.realpathSync.native(root);
+    if (resolvedRoot !== fs.realpathSync.native(artifactRoot(job.repo_root))) return null;
+    const resolvedTask = fs.realpathSync.native(job.task_directory);
+    if (resolvedTask !== job.task_directory) return null;
+    if (path.dirname(resolvedTask) !== resolvedRoot || !/^\d{3,}-/.test(path.basename(resolvedTask))) return null;
+    const sessionPath = path.join(resolvedTask, "session.json");
+    if (fs.realpathSync.native(sessionPath) !== sessionPath) return null;
+    const session = readJson(sessionPath);
+    if (
+      !session ||
+      session.repo_root !== job.repo_root ||
+      typeof session.session_id !== "string" ||
+      !session.session_id
+    ) {
+      return null;
+    }
+    return session.session_id;
+  } catch {
+    return null;
+  }
+}
+
+function renderJob(root, job, includeResult = false) {
   const lines = [
     `Claude review job: ${job.id}`,
     `Status: ${job.status}`,
     `Repository: ${job.repo_root}`,
     `Scope: ${job.scope?.kind ?? "unknown"}`,
     `Session: ${job.resumed ? "resumed" : "new"}`,
-    `Session ID: ${job.session_id ?? "unknown"}`
+    `Session ID: ${jobSessionId(root, job) ?? "unknown"}`
   ];
   if (job.pid) lines.push(`PID: ${job.pid}`);
   if (job.artifact) lines.push(`Artifact: ${job.artifact}`);
@@ -1297,7 +1369,7 @@ async function runInternalJob(jobIdValue, repoRoot) {
   const cancellation = installCancellationHandlers(root, job);
   try {
     const completed = await executeJob(root, job);
-    if (!cancellation.cancelled()) process.stdout.write(`${renderJob(completed)}\n`);
+    if (!cancellation.cancelled()) process.stdout.write(`${renderJob(root, completed)}\n`);
   } catch (error) {
     if (!cancellation.cancelled()) {
       process.stderr.write(`${error.message}\n`);
@@ -1383,12 +1455,12 @@ export async function main(argv = process.argv.slice(2)) {
   }
   if (parsed.action === "status") {
     const selected = chooseJob(root, parsed.jobId);
-    process.stdout.write(`${renderJob(selected)}\n`);
+    process.stdout.write(`${renderJob(root, selected)}\n`);
     return;
   }
   if (parsed.action === "result") {
     const selected = chooseJob(root, parsed.jobId);
-    process.stdout.write(`${renderJob(selected, true)}\n`);
+    process.stdout.write(`${renderJob(root, selected, true)}\n`);
     return;
   }
   if (parsed.action === "cancel") {
@@ -1400,13 +1472,13 @@ export async function main(argv = process.argv.slice(2)) {
   const job = await prepareJob(parsed, repoRoot, root);
   if (parsed.options.background) {
     const started = startBackground(root, job);
-    process.stdout.write(`${renderJob(started)}\nUse status or result with this job ID.\n`);
+    process.stdout.write(`${renderJob(root, started)}\nUse status or result with this job ID.\n`);
     return;
   }
   const cancellation = installCancellationHandlers(root, job);
   try {
     const completed = await executeJob(root, job);
-    if (!cancellation.cancelled()) process.stdout.write(`${renderJob(completed, true)}\n`);
+    if (!cancellation.cancelled()) process.stdout.write(`${renderJob(root, completed, true)}\n`);
   } finally {
     cancellation.cleanup();
   }
