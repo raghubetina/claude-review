@@ -1,3 +1,13 @@
+> **Moved.** This plugin now lives in [raghubetina/cross-review](https://github.com/raghubetina/cross-review)
+> alongside its inverse, codex-review. Install from there:
+>
+> ```sh
+> codex plugin marketplace add raghubetina/cross-review
+> codex plugin add claude-review@cross-review
+> ```
+>
+> This repository is archived and kept for history.
+
 # Claude Review
 
 Ask Claude Code to review exact Git scopes from Codex. Reviews are read-only, default to maximum reasoning effort, can run in the background, and can optionally resume the same Claude session as code changes.
